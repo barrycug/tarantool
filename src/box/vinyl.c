@@ -4668,6 +4668,182 @@ struct sdindex {
 	struct sdindexheader h;
 };
 
+struct PACKED branch_header {
+	//offset in file
+	uint64_t offset;
+	uint32_t count;
+	uint32_t size;
+	uint32_t data_size;
+	char reserved[4];
+	struct {
+		uint32_t offset;
+		uint32_t size;
+	} minmax[2];
+	uint64_t minlsn;
+	uint64_t maxlsn;
+};
+
+struct PACKED branch_page_header {
+	//offset in branch
+	uint32_t offset;
+	uint32_t size;
+	uint32_t count;
+	char reserved[4];
+	struct {
+		uint32_t offset;
+		uint32_t size;
+	} minmax[2];
+	uint64_t minlsn;
+	uint64_t maxlsn;
+};
+
+struct PACKED branch_tuple_header {
+	//offset in branch
+	uint32_t offset;
+	uint32_t flags;
+	uint32_t size;
+	char reserverd[4];
+};
+
+struct branch_index {
+	struct key_def *key_def;
+	struct branch_header *header;
+	struct branch_page_header *pages;
+	//struct for file reading and writing
+	struct {
+		int fd;
+	//in memory buffers for branch navigation
+		struct branch_header header;
+		struct ssbuf page_headers;
+		struct ssbuf page_ranges;
+	//array of buffers for page data, may be null if page not in memory
+		struct {
+			struct ssbuf offsets;
+			struct ssbuf datas;
+		} **pages;
+	} backend;
+};
+
+struct branch_iter {
+	struct branch_index *branch;
+	int32_t direction;
+	uint32_t page_no;
+	uint32_t tuple_no;
+	uint64_t lsn;
+};
+
+static inline char *
+branch_page_minmax(struct branch_index *index, uint32_t page_no, uint8_t minmax)
+{
+	return index->backend.page_ranges.s + index->pages[page_no].minmax[minmax].offset;
+}
+
+static int
+branch_load_page(struct branch_index *index, uint32_t page_no)
+{
+	if (index->backend.pages[page_no])
+		return 0;
+	return -1;
+}
+
+static inline char *
+branch_get_tuple(struct branch_index *index, uint32_t page_no, uint32_t tuple_no)
+{
+	struct branch_tuple_header *tuple_headers =
+		(struct branch_tuple_header *)(index->backend.pages[page_no]->offsets.s);
+	return index->backend.pages[page_no]->datas.s +
+		tuple_headers[tuple_no].offset;
+}
+
+static inline char *
+branch_iter_get(struct branch_iter *iter)
+{
+	return branch_get_tuple(iter->branch, iter->page_no, iter->tuple_no);
+}
+
+static uint32_t
+branch_iter_locate_page(struct branch_iter *iter, char *key)
+{
+	struct branch_index *index = iter->branch;
+	uint32_t delta = index->header->count - 1;
+
+	int minmax = (iter->direction + 1) >> 1;
+	while (delta) {
+		uint32_t test_pos = iter->page_no + iter->direction * (delta >> 1);
+		int next_min = sf_compare(index->key_def,
+					  branch_page_minmax(index, test_pos + iter->direction, 1 - minmax),
+					  key);
+		if (next_min * iter->direction < 0) {
+			iter->page_no = test_pos;
+			delta = (delta + 1) >> 1;
+			continue;
+		}
+		int prev_max = sf_compare(index->key_def,
+					  branch_page_minmax(index,  test_pos, minmax),
+					  key);
+		if (prev_max * iter->direction >= 0) {
+			delta = delta >> 1;
+			continue;
+		}
+		iter->page_no += delta;
+		break;
+	}
+	return iter->page_no;
+}
+
+static uint32_t
+branch_iter_locate_tuple(struct branch_iter *iter, char *key)
+{
+	struct branch_index *index = iter->branch;
+	struct branch_page_header *page = index->pages + iter->page_no;
+	uint32_t delta = page->count;
+	//FIXME: check result
+	branch_load_page(index, iter->page_no);
+
+	while (delta) {
+		uint32_t test_pos = iter->tuple_no + iter->direction * (delta >> 1);
+		int cmp = sf_compare(index->key_def,
+				     branch_get_tuple(index, iter->page_no, test_pos),
+				     key);
+		if (cmp * iter->direction < 0) {
+			iter->tuple_no = test_pos;
+			delta = (delta + 1) >> 1;
+		} else {
+			delta = delta >> 1;
+		}
+	}
+	return sf_compare(index->key_def, branch_iter_get(iter), key);
+}
+
+static int
+branch_iter_init(struct branch_iter *iter, struct branch_index *index,
+		 uint64_t lsn, char *key, int oper)
+{
+	(void) lsn;
+	iter->branch = index;
+	switch (oper) {
+		case VINYL_LT:
+		case VINYL_LE:
+			iter->direction = -1;
+			iter->page_no = iter->branch->header->count - 1;
+			iter->tuple_no = iter->branch->pages[iter->page_no].count - 1;
+			break;
+		case VINYL_GT:
+		case VINYL_GE:
+			iter->direction = 1;
+			iter->page_no = 0;
+			iter->tuple_no = 0;
+			break;
+		default:
+			unreachable();
+	}
+	if (key) {
+		branch_iter_locate_page(iter, key);
+		branch_iter_locate_tuple(iter, key);
+	}
+	return 0;
+}
+
 static inline char*
 sd_indexpage_min(struct sdindex *i, struct sdindexpage *p) {
 	return (char*)i->minmax.s + p->offsetindex;
@@ -5017,7 +5193,6 @@ struct sdmerge {
 	struct svmergeiter *merge;
 	struct svwriteiter i;
 	struct sdmergeconf *conf;
-	struct sdbuild     *build;
 	uint64_t    processed;
 	uint64_t    current;
 	uint64_t    limit;
